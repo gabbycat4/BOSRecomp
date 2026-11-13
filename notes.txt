@@ -13,10 +13,16 @@ Status (2026-11-13)
   120/180/240 pictures per second, --scroll-log / --oam-log.
 
 Measurements (fill in from scroll.log / oam.log / Mesen)
-- Camera: scrolls in X? in Y? step sizes? every frame or every other?
-- HUD / status bar split line:
-- Busiest line sprite count (above 8 = flicker):
-- OAM order: does the game rotate its sprite list each frame?
-- Player movement rate (30 Hz or 60 Hz):
+- 100.0% native over route_play.txt (18500 frames) - done.
+- Camera: X moves EVERY frame (60 Hz) when it moves, steps 1-7 px
+  (often a steady 2, 4 or 5 px/frame). Y moves a little (+-1/2) sometimes.
+  Scroll spans 512 (two nametables).
+- No HUD split: the whole screen (rows 0-239) is one scrolling playfield.
+- Busiest line: up to 15 sprites (above 8 = the NES's flicker).
+- OAM order: the game rotates its list every frame (same sprites,
+  different slots), so ties must not be broken by slot number.
+- WHITE FLASH: players switch from their team palette (0 or 1) to
+  palette 3 for 2 frames out of every 6 (10 Hz). FlashSoften handles it.
+- Player movement rate (30 Hz or 60 Hz): TODO (for character glide)
 
 Bugs seen while playing (where / what):

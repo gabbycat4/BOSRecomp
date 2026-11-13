@@ -22,6 +22,11 @@
  *                 the game rotates its list), 1 (default) lower on screen in
  *                 front (players nearer the camera cover the ones behind).
  *
+ *   Flash soften  [Game] FlashSoften: the game flashes the player with the
+ *                 puck by switching him to a bright palette 2 frames in 6.
+ *                 0 as the game, 1 a soft tint, 2 no flash, 3 (default) a
+ *                 slow pulse (fades in and out 1.25 times a second).
+ *
  *   Smooth camera [Game] SmoothCamera (default 1): evens out the camera's
  *                 steps by shifting the rink by up to SmoothMargin px (3);
  *                 the crop grows by that margin so no undrawn edge shows.
@@ -66,7 +71,6 @@ static int  s_scale_saved = 4, s_scale = 4;
 static int  s_margin_saved = BOS_SMOOTH_MARGIN, s_margin = BOS_SMOOTH_MARGIN;
 
 /* ---- per-frame state ---- */
-static long          s_frame;
 static CycHostExtras s_extras;              /* defined at the end */
 static int           s_line = 120;          /* playfield line sampled */
 static BosSmooth     s_smx, s_smy;
@@ -99,8 +103,147 @@ static void find_playfield(void)
     s_bot = b;
 }
 
+/* ---- flash softening (FlashSoften) ----
+ * Measured (oam.log): the game flashes a player by switching his sprites
+ * from his team's palette (0 or 1) to palette 3 for 2 frames out of every 6.
+ * Each frame this matches every palette-3 sprite to the same tile in the
+ * previous frame (allowing for the camera's step and a few px of movement);
+ * if that one had another palette, or was itself a flash, the sprite is
+ * flashing and s_base[slot] holds his own palette. Drawing then mixes the
+ * flash colour into his own (1: soft) or leaves it out (2: none). Sprites
+ * that are always palette 3 never match a different palette, so they stay. */
+enum { FLASH_REACH = 8, FLASH_MAX_RUN = 3, FLASH_SOFT_PERCENT = 30,
+       FLASH_HOLD = 8,           /* frames a player counts as flashing after his last flash */
+       PULSE_PERIOD = 48,        /* frames per slow pulse (1.25 a second) */
+       PULSE_PERCENT = 70 };     /* strongest mix of the flash colour in a pulse */
+enum { SOFT_OFF, SOFT_SOFT, SOFT_NONE, SOFT_PULSE, SOFT_MODES };
+typedef struct { uint8_t y, tile, attr, x; int8_t base; uint8_t run, age; } FlSprite;
+static FlSprite s_fl_prev[64];
+static int      s_fl_prev_n, s_flashing;
+static int8_t   s_base[64];      /* flashing now: the player's own palette, else -1 */
+static int8_t   s_own[64];       /* the sprite's own palette (base, or its palette) */
+static uint8_t  s_age[64];       /* frames since the sprite last flashed, 255: not flashing */
+static int      s_soft_saved = SOFT_PULSE, s_soft = SOFT_PULSE;
+
+static bool touching(const uint8_t *a, const uint8_t *b, int h)
+{
+    return a[3] <= b[3] + 9 && b[3] <= a[3] + 9 && a[0] <= b[0] + h + 1 && b[0] <= a[0] + h + 1;
+}
+
+static void flash_frame(bool on, int dx, int dy)
+{
+    const uint8_t *oam = cyc_render_oam();
+    FlSprite cur[64];
+    int n = 0;
+    s_flashing = 0;
+    if (!on) dx = dy = 0;
+    for (int slot = 0; slot < 64; ++slot) {
+        const uint8_t *o = oam + slot * 4;
+        s_base[slot] = -1;
+        s_own[slot] = (int8_t)(o[2] & 3);
+        s_age[slot] = 255;
+        if (o[0] >= 0xEF) continue;
+        FlSprite c = { o[0], o[1], o[2], o[3], -1, 0, 255 };
+        int best = -1, bd = 1 << 30;
+        for (int j = 0; j < s_fl_prev_n; ++j) {
+            const FlSprite *p = &s_fl_prev[j];
+            if (p->tile != o[1] || ((p->attr ^ o[2]) & 0xC0)) continue;
+            int ex = o[3] - (p->x - dx), ey = o[0] - (p->y - dy);
+            if (abs(ex) > FLASH_REACH || abs(ey) > FLASH_REACH) continue;
+            int d = abs(ex) + abs(ey);
+            if (d < bd) { bd = d; best = j; }
+        }
+        const FlSprite *p = best >= 0 ? &s_fl_prev[best] : NULL;
+        if ((o[2] & 3) == 3) {
+            /* Palette 3: a flash if the same sprite had a team palette (or was flashing). */
+            if (p && (p->attr & 3) != 3) { c.base = (int8_t)(p->attr & 3); c.run = 1; }
+            else if (p && p->base >= 0 && p->run < FLASH_MAX_RUN) { c.base = p->base; c.run = (uint8_t)(p->run + 1); }
+            if (c.base >= 0) c.age = 0;
+        } else if (p && p->age < FLASH_HOLD && (p->base == (int8_t)(o[2] & 3) || (p->attr & 3) == (o[2] & 3))) {
+            c.age = (uint8_t)(p->age + 1);            /* between flashes: still the flashing player */
+        }
+        s_base[slot] = c.base;
+        if (c.base >= 0) s_own[slot] = c.base;
+        s_age[slot] = c.age;
+        cur[n++] = c;
+    }
+    memcpy(s_fl_prev, cur, sizeof(cur[0]) * (size_t)n);
+    s_fl_prev_n = n;
+
+    /* A sprite that changed tile this frame (animation) has no match: give
+     * it the flashing state of a touching sprite of the same player, so a
+     * flash or pulse covers the whole player. */
+    int h = cyc_render_line_sprite16(120) ? 16 : 8;
+    for (int pass = 0; pass < 4; ++pass) {
+        bool grew = false;
+        for (int a = 0; a < 64; ++a) {
+            const uint8_t *oa = oam + a * 4;
+            if (oa[0] >= 0xEF || s_age[a] <= FLASH_HOLD) continue;
+            for (int b = 0; b < 64; ++b) {
+                const uint8_t *ob = oam + b * 4;
+                if (b == a || ob[0] >= 0xEF || s_age[b] > FLASH_HOLD || !touching(oa, ob, h)) continue;
+                bool pal3 = (oa[2] & 3) == 3;
+                if (!pal3 && s_own[b] != (int8_t)(oa[2] & 3)) continue;
+                if (pal3 && s_base[b] < 0) continue;  /* only a flashing neighbour vouches for palette 3 */
+                s_age[a] = s_age[b];
+                if (pal3) { s_base[a] = s_own[a] = s_own[b]; }
+                grew = true;
+                break;
+            }
+        }
+        if (!grew) break;
+    }
+    for (int i = 0; i < 64; ++i) s_flashing += s_age[i] <= FLASH_HOLD;
+}
+
+static uint32_t mix(uint32_t a, uint32_t b, int pb)   /* pb percent of b */
+{
+    uint32_t out = a & 0xFF000000u;
+    for (int sh = 0; sh < 24; sh += 8) {
+        int ca = (int)((a >> sh) & 255), cb = (int)((b >> sh) & 255);
+        out |= (uint32_t)((ca * (100 - pb) + cb * pb) / 100) << sh;
+    }
+    return out;
+}
+
+static long s_frame;
+static int pulse_percent(void)
+{
+    double t = (double)(s_frame % PULSE_PERIOD) / PULSE_PERIOD;
+    return (int)lround(PULSE_PERCENT * (0.5 - 0.5 * cos(2.0 * 3.14159265358979 * t)));
+}
+
+static bool flash_touched(int slot)
+{
+    if (!s_soft) return false;
+    if (s_soft == SOFT_PULSE) return s_age[slot] <= FLASH_HOLD;
+    return s_base[slot] >= 0;
+}
+
+static uint32_t sprite_colour(int slot, unsigned attr, int v)
+{
+    uint32_t c = cyc_render_color(16 + (int)(attr & 3) * 4 + v);
+    if (!flash_touched(slot)) return c;
+    uint32_t own = cyc_render_color(16 + s_own[slot] * 4 + v);
+    uint32_t flash = cyc_render_color(16 + 3 * 4 + v);
+    if (s_soft == SOFT_NONE) return own;
+    if (s_soft == SOFT_SOFT) return mix(own, flash, FLASH_SOFT_PERCENT);
+    return mix(own, flash, pulse_percent());
+}
+
 /* ---- sprites ---- */
 static int s_slots[64], s_nslots;          /* visible sprites, top priority first */
+
+/* Lower on screen in front. The game rotates its sprite list every frame,
+ * so ties (same row) are broken by X, tile and attributes, never by slot:
+ * the same overlap draws the same way every frame. */
+static bool in_front(const uint8_t *a, const uint8_t *b)
+{
+    if (a[0] != b[0]) return a[0] > b[0];
+    if (a[3] != b[3]) return a[3] < b[3];
+    if (a[1] != b[1]) return a[1] < b[1];
+    return a[2] < b[2];
+}
 
 static void sprite_order(void)
 {
@@ -109,10 +252,9 @@ static void sprite_order(void)
     for (int slot = 0; slot < 64; ++slot)
         if (oam[slot * 4] < 0xEF) s_slots[s_nslots++] = slot;
     if (s_order != 1) return;
-    /* Lower on screen in front; the same row keeps OAM order. */
     for (int i = 1; i < s_nslots; ++i) {
         int v = s_slots[i], j = i;
-        while (j > 0 && oam[s_slots[j - 1] * 4] < oam[v * 4]) { s_slots[j] = s_slots[j - 1]; --j; }
+        while (j > 0 && in_front(oam + v * 4, oam + s_slots[j - 1] * 4)) { s_slots[j] = s_slots[j - 1]; --j; }
         s_slots[j] = v;
     }
 }
@@ -156,7 +298,7 @@ static void sprite_layer_all(int y0, int y1)
                 int v = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
                 if (!v) continue;
                 at[px] = (attr & 0x20) ? 2 : 1;
-                col[px] = cyc_render_color(16 + (int)(attr & 3) * 4 + v);
+                col[px] = sprite_colour(s_slots[k], attr, v);
             }
         }
     }
@@ -194,10 +336,11 @@ static void sprite_layer_native(const uint32_t *native, int y0, int y1)
                 if (px >= NES_W) break;
                 if (at[px] || (px < 8 && !(mask & 0x04))) continue;
                 int bit = (attr & 0x40) ? c : 7 - c;
-                if (!(((lo >> bit) & 1) | (((hi >> bit) & 1) << 1))) continue;
+                int v = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+                if (!v) continue;
                 if ((attr & 0x20) && opaque[px]) { at[px] = 3; continue; }   /* hidden: taken, not shown */
                 at[px] = 1;
-                col[px] = native[py * NES_W + px];
+                col[px] = flash_touched(slot) ? sprite_colour(slot, attr, v) : native[py * NES_W + px];
             }
         }
         for (int x = 0; x < NES_W; ++x) if (at[x] == 3) at[x] = 0;
@@ -327,6 +470,7 @@ static void load_setting(void *ctx, const char *key, const char *value)
     else if (!strcmp(key, "NoSpriteLimit"))  s_unlimit = s_unlimit_saved = v != 0;
     else if (!strcmp(key, "SpriteOrder"))    s_order = s_order_saved = clampi(v, 0, 1);
     else if (!strcmp(key, "PresentRate"))    s_present_rate = s_rate_saved = clampi(v, 0, 1000);
+    else if (!strcmp(key, "FlashSoften"))    s_soft = s_soft_saved = clampi(v, 0, SOFT_MODES - 1);
     else if (!strcmp(key, "PresentScale"))   s_scale = s_scale_saved = clampi(v, 1, SCALE_MAX);
     s_crop = s_crop_saved;
 }
@@ -342,6 +486,7 @@ static void save_settings(void *ctx, FILE *f)
     fprintf(f, "SmoothMargin = %d\n", s_margin_saved);
     fprintf(f, "NoSpriteLimit = %d\n", s_unlimit_saved);
     fprintf(f, "SpriteOrder = %d\n", s_order_saved);
+    fprintf(f, "FlashSoften = %d\n", s_soft_saved);
     fprintf(f, "PresentRate = %d\n", s_rate_saved);
     fprintf(f, "PresentScale = %d\n", s_scale_saved);
 }
@@ -406,6 +551,7 @@ static void frame_end(void *ctx)
     s_prev_y = on ? y : -1;
     int ox = bos_smooth_frame(&s_smx, on, dx);
     int oy = bos_smooth_frame(&s_smy, on, dy);
+    flash_frame(on, dx, dy);
 
     if (s_oam_log) {
         const uint8_t *oam = cyc_render_oam();
@@ -419,8 +565,8 @@ static void frame_end(void *ctx)
     int n = 0;
     for (int i = 0; i < 64; ++i) n += oam[i * 4] < 0xEF;
     if (!on) { fprintf(s_log, "%6ld  off  %3d  %3d\n", f, n, busiest_line()); fflush(s_log); return; }
-    fprintf(s_log, "%6ld  %4d  %+3d  %4d  %+3d  %3d  %3d  %3d  %3d  %+2d  %+2d\n",
-            f, x, dx, y, dy, s_top, s_bot, n, busiest_line(), ox, oy);
+    fprintf(s_log, "%6ld  %4d  %+3d  %4d  %+3d  %3d  %3d  %3d  %3d  %+2d  %+2d  %2d\n",
+            f, x, dx, y, dy, s_top, s_bot, n, busiest_line(), ox, oy, s_flashing);
     fflush(s_log);
 }
 
@@ -434,6 +580,7 @@ static const CycHostOption s_options[] = {
     { "--smooth-margin",   true, "N: smoothing margin in px, 1-12 (default 3)" },
     { "--no-sprite-limit", true, "0|1: draw every sprite (no flicker) for this run" },
     { "--sprite-order",    true, "0|1: overlaps in the game's order / lower on screen in front" },
+    { "--flash-soften",    true, "0|1|2|3: player flash as the game / soft / none / slow pulse" },
     { "--present-rate",    true, "N: pictures per second, e.g. 120 or 240 (0: one per frame)" },
     { "--present-scale",   true, "K: picture scale 1-6 (default 4)" },
 };
@@ -457,7 +604,7 @@ static bool option(void *ctx, const char *name, const char *value)
         *fp = fopen(value, "w");
         if (!*fp) { perror(value); return false; }
         if (scroll)
-            fprintf(*fp, "# frame  scrollX  dx  scrollY  dy  top  bottom  sprites  busiestLine  shiftX  shiftY\n");
+            fprintf(*fp, "# frame  scrollX  dx  scrollY  dy  top  bottom  sprites  busiestLine  shiftX  shiftY  flashing\n");
         return true;
     }
     if (!strcmp(name, "--scroll-line"))    return parse_int(value, 1, NES_H - 2, &s_line);
@@ -466,6 +613,7 @@ static bool option(void *ctx, const char *name, const char *value)
     if (!strcmp(name, "--smooth-margin"))  return parse_int(value, 1, BOS_SMOOTH_MARGIN_MAX, &s_margin);
     if (!strcmp(name, "--no-sprite-limit")) return parse_int(value, 0, 1, &s_unlimit);
     if (!strcmp(name, "--sprite-order"))   return parse_int(value, 0, 1, &s_order);
+    if (!strcmp(name, "--flash-soften"))   return parse_int(value, 0, SOFT_MODES - 1, &s_soft);
     if (!strcmp(name, "--present-scale"))  return parse_int(value, 1, SCALE_MAX, &s_scale);
     if (!strcmp(name, "--present-rate")) {
         if (!parse_int(value, 0, 1000, &s_present_rate)) return false;
@@ -483,6 +631,8 @@ static bool option(void *ctx, const char *name, const char *value)
 static const char *const RATE_CHOICES[] = { "60 (off)", "120", "180", "240" };
 static const int RATE_VALUES[] = { 0, 120, 180, 240 };
 static const char *const ORDER_CHOICES[] = { "Game's order", "Lower on screen in front" };
+static const char *const SOFT_CHOICES[] = { "Off (as the game)", "Soft", "Slow pulse", "None" };
+static const int SOFT_VALUES[] = { SOFT_OFF, SOFT_SOFT, SOFT_PULSE, SOFT_NONE };
 static const char *const CROP_CHOICES[] = { "Off", "Standard", "More", "Custom (config.ini)" };
 static const Crop CROP_PRESETS[] = { { 0, 0, 0, 0 }, { 8, 8, 8, 8 }, { 12, 12, 12, 12 } };
 
@@ -497,6 +647,10 @@ static const RecompRuntimeUiItem s_menu[] = {
     { "bos.unlimit", "Picture", "No sprite flicker",
       "Draws every sprite every frame instead of the NES's 8 per line, so players stop flashing.",
       RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+    { "bos.soften", "Picture", "Player flashing",
+      "The game flashes the player with the puck bright white 10 times a second. Slow pulse: he fades "
+      "gently in and out instead. Soft: a faint fast flash. None: no flash at all.",
+      RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, SOFT_CHOICES, 4, SOFT_VALUES },
     { "bos.order", "Picture", "Overlapping sprites",
       "Which sprite is in front where two overlap (with No sprite flicker on).",
       RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, ORDER_CHOICES, 2, NULL },
@@ -527,6 +681,7 @@ static int menu_get(void *ctx, const RecompRuntimeUiItem *it, int *out)
     }
     else if (key_is(it, "bos.unlimit")) *out = s_unlimit;
     else if (key_is(it, "bos.order")) *out = s_order;
+    else if (key_is(it, "bos.soften")) *out = s_soft;
     else if (key_is(it, "bos.crop")) *out = crop_preset();
     else return 0;
     return 1;
@@ -542,6 +697,7 @@ static int menu_set(void *ctx, const RecompRuntimeUiItem *it, int v)
     }
     else if (key_is(it, "bos.unlimit")) { s_unlimit = s_unlimit_saved = v != 0; s_prepared = -1; }
     else if (key_is(it, "bos.order")) { s_order = s_order_saved = clampi(v, 0, 1); s_prepared = -1; }
+    else if (key_is(it, "bos.soften")) { s_soft = s_soft_saved = clampi(v, 0, SOFT_MODES - 1); s_prepared = -1; }
     else if (key_is(it, "bos.crop")) {
         if (v < 0 || v > 2) return 0;              /* Custom: edit config.ini */
         s_crop = s_crop_saved = CROP_PRESETS[v];
