@@ -1,0 +1,4 @@
+[game]
+output_prefix = "bos"
+name = "Blades of Steel"
+cycle_accurate = true

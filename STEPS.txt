@@ -1,0 +1,30 @@
+BLADES OF STEEL - NEXT STEPS (run in fish, one block at a time)
+================================================================
+
+1) Go to the project
+    cd ~/Projects/BOSRecomp
+
+2) Build the headless (no window) version
+    cmake -S . -B build-headless -G Ninja -DCMAKE_BUILD_TYPE=Release -DNESRECOMP_HEADLESS=ON
+    cmake --build build-headless --parallel
+
+3) Play the long route: harvests gameplay code AND records measurements
+    mkdir -p shots
+    ./build-headless/bosrecomp bos.nes --frames 18500 --input route_play.txt --miss-log seeds.txt --capture-log capture.txt --scroll-log scroll.log --oam-log oam.log
+
+4) Rebuild with the new seeds, then check it is 100% native
+    cmake --build build-headless --parallel
+    ./build-headless/bosrecomp bos.nes --frames 18500 --input route_play.txt --shot-every 1500 --screenshot shots/play.png
+   Look for "native" in the summary. Not 100.0%? Repeat step 3 and 4.
+
+5) Build the window version (the one you play)
+    cmake -S . -B build-play -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build-play --parallel
+
+6) Play it
+    ./build-play/bosrecomp bos.nes
+   Esc (or the right shoulder button) opens the menu. New sections:
+   "Smooth motion" and "Picture".
+
+THE GAME FILE (your "exe"): ~/Projects/BOSRecomp/build-play/bosrecomp
+(Linux programs have no .exe ending. The old one was build-sdl/nes_game.)

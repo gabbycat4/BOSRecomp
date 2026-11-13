@@ -1,0 +1,22 @@
+BLADES OF STEEL RECOMP - NOTES
+==============================
+ROM: bos.nes, SHA-1 26ab09e19d3f78d749443c116f29ffdd4186231d
+     (128 KB PRG, CHR RAM, mapper 2 = UxROM, vertical mirroring)
+Engine: ~/Projects/nesrecomp, branch dd2-240hz (commit 8c619f5)
+Menu (recomp-ui): borrowed from ~/Projects/DD2Recomp/recomp-ui
+
+Status (2026-11-13)
+- Phases 0-2 done; route.txt reaches the opening faceoff (~frame 2400).
+- route_play.txt = route.txt + ~4 minutes of random play after the faceoff,
+  to harvest gameplay code and record logs.
+- src/bos_extras.c v1: edge crop, no sprite flicker, smooth camera,
+  120/180/240 pictures per second, --scroll-log / --oam-log.
+
+Measurements (fill in from scroll.log / oam.log / Mesen)
+- Camera: scrolls in X? in Y? step sizes? every frame or every other?
+- HUD / status bar split line:
+- Busiest line sprite count (above 8 = flicker):
+- OAM order: does the game rotate its sprite list each frame?
+- Player movement rate (30 Hz or 60 Hz):
+
+Bugs seen while playing (where / what):

@@ -1,0 +1,64 @@
+# Blades of Steel (USA) on the NESRecomp cycle backend.
+#
+#   cmake -S . -B build-play -G Ninja -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build-play --parallel
+#   ./build-play/bosrecomp bos.nes
+#
+# Your own ROM: bos.nes beside this file, or -DBOS_ROM=/path/to/rom.nes.
+# Headless (logs, harvesting): add -DNESRECOMP_HEADLESS=ON, separate build dir.
+cmake_minimum_required(VERSION 3.20)
+project(BOSRecomp C)
+
+# The engine: a nesrecomp submodule here, else the shared fixed fork.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nesrecomp/runner/cyc/project.cmake")
+    set(_bos_engine "${CMAKE_CURRENT_SOURCE_DIR}/nesrecomp")
+else()
+    set(_bos_engine "$ENV{HOME}/Projects/nesrecomp")
+endif()
+set(NESRECOMP_ROOT "${_bos_engine}" CACHE PATH "nesrecomp engine checkout")
+if(NOT EXISTS "${NESRECOMP_ROOT}/runner/cyc/project.cmake")
+    message(FATAL_ERROR "NESRECOMP_ROOT=${NESRECOMP_ROOT} is not a nesrecomp checkout")
+endif()
+
+# The launcher and in-game menu (recomp-ui): a submodule here, else the copy
+# in DD2Recomp (pinned at the tested commit there).
+if(NOT DEFINED CACHE{NESRECOMP_RECOMP_UI}
+   AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui/recomp_ui.cmake"
+   AND EXISTS "$ENV{HOME}/Projects/DD2Recomp/recomp-ui/recomp_ui.cmake")
+    set(NESRECOMP_RECOMP_UI "$ENV{HOME}/Projects/DD2Recomp/recomp-ui" CACHE STRING
+        "recomp-ui checkout for the cycle host's launcher and menu")
+endif()
+
+set(BOS_ROM "${CMAKE_CURRENT_SOURCE_DIR}/bos.nes" CACHE FILEPATH "Blades of Steel (USA) ROM")
+if(NOT EXISTS "${BOS_ROM}")
+    message(FATAL_ERROR "No ROM at ${BOS_ROM}: put your Blades of Steel (USA) dump there as bos.nes, "
+                        "or pass -DBOS_ROM=/path/to/rom.nes")
+endif()
+option(NESRECOMP_HEADLESS "Build without SDL window/audio support" OFF)
+
+include("${NESRECOMP_ROOT}/runner/cyc/project.cmake")
+
+set(bos_options "")
+if(NESRECOMP_HEADLESS)
+    list(APPEND bos_options HEADLESS)
+endif()
+
+# seeds.txt: ROM code addresses to compile (no game data, safe to commit).
+# capture.txt: code the game copies into RAM (holds game bytes, local only).
+set(bos_capture "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/capture.txt")
+    set(bos_capture CAPTURE_FILE "capture.txt")
+endif()
+nesrecomp_add_cycle_game(bosrecomp
+    ROM          "${BOS_ROM}"
+    GAME_CONFIG  "game.toml"
+    SEED_FILE    "seeds.txt"
+    ${bos_capture}
+    PLAYERS 2
+    REGION NTSC
+    HOST_EXTRAS  "src/bos_extras.c" "src/bos_smooth.c"
+    ${bos_options})
+
+if(UNIX)
+    target_link_libraries(bosrecomp PRIVATE m)
+endif()
