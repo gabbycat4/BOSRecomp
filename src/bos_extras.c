@@ -25,12 +25,19 @@
  *   Flash soften  [Game] FlashSoften: the game flashes the player with the
  *                 puck by switching him to a bright palette 2 frames in 6.
  *                 0 as the game, 1 a soft tint, 2 no flash, 3 (default) a
- *                 slow pulse (fades in and out 1.25 times a second).
+ *                 slow pulse (fades in and out 1.25 times a second), 4 a
+ *                 steady glow (no flashing at all). [Game] FlashColour: the
+ *                 highlight's colour, 0 the game's white, 1 (default) gold,
+ *                 2 sky blue, 3 green, 4 pink, 5 lavender.
  *
  *   Smooth camera [Game] SmoothCamera (default 1): evens out the camera's
  *                 steps by shifting the rink by up to SmoothMargin px (3);
  *                 the crop grows by that margin so no undrawn edge shows.
  *                 Sprites stay where the game drew them.
+ *
+ *   Player glide  [Game] CharGlide: with PresentRate above 60, players glide
+ *                 between the game's 60 Hz positions. 0 off, 1 (default)
+ *                 smooth (up to 1/60 s behind), 2 low lag (predicts).
  *
  *   High refresh  [Game] PresentRate (0 = 60, or 120/180/240): extra
  *                 pictures between the NES's frames in which the camera
@@ -116,7 +123,13 @@ enum { FLASH_REACH = 8, FLASH_MAX_RUN = 3, FLASH_SOFT_PERCENT = 30,
        FLASH_HOLD = 8,           /* frames a player counts as flashing after his last flash */
        PULSE_PERIOD = 48,        /* frames per slow pulse (1.25 a second) */
        PULSE_PERCENT = 70 };     /* strongest mix of the flash colour in a pulse */
-enum { SOFT_OFF, SOFT_SOFT, SOFT_NONE, SOFT_PULSE, SOFT_MODES };
+enum { SOFT_OFF, SOFT_SOFT, SOFT_NONE, SOFT_PULSE, SOFT_STEADY, SOFT_MODES };
+enum { STEADY_PERCENT = 45 };    /* Steady glow: a constant mix of the highlight colour */
+/* Highlight colour for Soft / Slow pulse / Steady glow: 0 the game's own
+ * flash colours, else a calm tint (ARGB). */
+static const uint32_t TINTS[] = { 0, 0xFFF2C94Cu, 0xFF6FB7E8u, 0xFF7FD28Cu, 0xFFE89AC7u, 0xFFB79CF0u };
+enum { TINT_COUNT = (int)(sizeof(TINTS) / sizeof(TINTS[0])) };
+static int s_tint_saved = 1, s_tint = 1;   /* gold */
 typedef struct { uint8_t y, tile, attr, x; int8_t base; uint8_t run, age; } FlSprite;
 static FlSprite s_fl_prev[64];
 static int      s_fl_prev_n, s_flashing;
@@ -216,7 +229,7 @@ static int pulse_percent(void)
 static bool flash_touched(int slot)
 {
     if (!s_soft) return false;
-    if (s_soft == SOFT_PULSE) return s_age[slot] <= FLASH_HOLD;
+    if (s_soft == SOFT_PULSE || s_soft == SOFT_STEADY) return s_age[slot] <= FLASH_HOLD;
     return s_base[slot] >= 0;
 }
 
@@ -225,9 +238,10 @@ static uint32_t sprite_colour(int slot, unsigned attr, int v)
     uint32_t c = cyc_render_color(16 + (int)(attr & 3) * 4 + v);
     if (!flash_touched(slot)) return c;
     uint32_t own = cyc_render_color(16 + s_own[slot] * 4 + v);
-    uint32_t flash = cyc_render_color(16 + 3 * 4 + v);
+    uint32_t flash = s_tint ? TINTS[s_tint] : cyc_render_color(16 + 3 * 4 + v);
     if (s_soft == SOFT_NONE) return own;
     if (s_soft == SOFT_SOFT) return mix(own, flash, FLASH_SOFT_PERCENT);
+    if (s_soft == SOFT_STEADY) return mix(own, flash, STEADY_PERCENT);
     return mix(own, flash, pulse_percent());
 }
 
@@ -256,6 +270,90 @@ static void sprite_order(void)
         int v = s_slots[i], j = i;
         while (j > 0 && in_front(oam + v * 4, oam + s_slots[j - 1] * 4)) { s_slots[j] = s_slots[j - 1]; --j; }
         s_slots[j] = v;
+    }
+}
+
+/* ---- character glide (CharGlide) ----
+ * Measured (oam.log): players move every frame (60 Hz), mostly 1-3 px, so
+ * at 120/180/240 pictures per second they hop while the rink glides. Each
+ * frame this matches every sprite to the same tile in the previous frame in
+ * rink coordinates (screen + camera), groups touching sprites into players,
+ * and lets a player glide only when 70% of his matched pieces agree on one
+ * movement; all his pieces then use it (a piece that changed pose too), so a
+ * player never tears. Unsure players are drawn where the game put them.
+ *   1 Smooth:  in-between pictures show players between the previous and
+ *              the current frame (drawn up to 1/60 s behind the game).
+ *   2 Low lag: they continue the current movement (never behind; can be a
+ *              fraction of a pixel off for one picture when a player turns). */
+enum { GL_REACH = 10, GL_AGREE = 70 };
+enum { GLIDE_OFF, GLIDE_SMOOTH, GLIDE_LOWLAG, GLIDE_MODES };
+typedef struct { uint8_t y, tile, attr, x; } GlSprite;
+static GlSprite s_gl_prev[64];
+static int      s_gl_prev_n, s_gliding;
+static int8_t   s_gdx[64], s_gdy[64];    /* per slot: the player's movement this frame, px */
+static bool     s_gl_ok[64];
+static int      s_glide_saved = GLIDE_SMOOTH, s_glide = GLIDE_SMOOTH;
+
+static int gl_find(int *parent, int i) { while (parent[i] != i) i = parent[i] = parent[parent[i]]; return i; }
+
+static void glide_frame(bool on, int dx, int dy)
+{
+    const uint8_t *oam = cyc_render_oam();
+    memset(s_gdx, 0, sizeof(s_gdx));
+    memset(s_gdy, 0, sizeof(s_gdy));
+    memset(s_gl_ok, 0, sizeof(s_gl_ok));
+    s_gliding = 0;
+    int vis[64], nv = 0;
+    for (int slot = 0; slot < 64; ++slot) if (oam[slot * 4] < 0xEF) vis[nv++] = slot;
+
+    if (on) {
+        int mx[64], my[64];
+        bool has[64];
+        for (int i = 0; i < nv; ++i) {
+            const uint8_t *o = oam + vis[i] * 4;
+            int bd = 1 << 30;
+            has[i] = false;
+            for (int j = 0; j < s_gl_prev_n; ++j) {
+                const GlSprite *p = &s_gl_prev[j];
+                if (p->tile != o[1] || ((p->attr ^ o[2]) & 0xC0)) continue;   /* palette may flash */
+                int ex = o[3] - p->x + dx, ey = o[0] - p->y + dy;
+                if (abs(ex) > GL_REACH || abs(ey) > GL_REACH) continue;
+                int d = abs(ex) + abs(ey);
+                if (d < bd) { bd = d; mx[i] = ex; my[i] = ey; has[i] = true; }
+            }
+        }
+        /* Players: touching sprites. */
+        int parent[64];
+        int h = cyc_render_line_sprite16(120) ? 16 : 8;
+        for (int i = 0; i < nv; ++i) parent[i] = i;
+        for (int i = 0; i < nv; ++i)
+            for (int j = i + 1; j < nv; ++j)
+                if (touching(oam + vis[i] * 4, oam + vis[j] * 4, h)) parent[gl_find(parent, i)] = gl_find(parent, j);
+        for (int r = 0; r < nv; ++r) {
+            if (gl_find(parent, r) != r) continue;
+            int m = 0, top = -1, topn = 0;
+            for (int i = 0; i < nv; ++i) {
+                if (gl_find(parent, i) != r || !has[i]) continue;
+                ++m;
+                int n = 0;
+                for (int j = 0; j < nv; ++j)
+                    if (gl_find(parent, j) == r && has[j] && mx[j] == mx[i] && my[j] == my[i]) ++n;
+                if (n > topn) { topn = n; top = i; }
+            }
+            if (!m || topn * 100 < m * GL_AGREE) continue;
+            for (int i = 0; i < nv; ++i) {
+                if (gl_find(parent, i) != r) continue;
+                s_gdx[vis[i]] = (int8_t)mx[top];
+                s_gdy[vis[i]] = (int8_t)my[top];
+                s_gl_ok[vis[i]] = true;
+                s_gliding += mx[top] || my[top];
+            }
+        }
+    }
+    s_gl_prev_n = 0;
+    for (int i = 0; i < nv; ++i) {
+        const uint8_t *o = oam + vis[i] * 4;
+        s_gl_prev[s_gl_prev_n++] = (GlSprite){ o[0], o[1], o[2], o[3] };
     }
 }
 
@@ -372,7 +470,8 @@ static void prepare(const uint32_t *native)
     s_prepared = s_frame;
     s_have_layers = cyc_render_background(s_bg);
     if (!s_have_layers) return;
-    if (s_unlimit) { sprite_order(); sprite_layer_all(0, NES_H); }
+    sprite_order();
+    if (s_unlimit) sprite_layer_all(0, NES_H);
     else sprite_layer_native(native, 0, NES_H);
 }
 
@@ -380,6 +479,62 @@ static int floordiv(int a, int k) { return a >= 0 ? a / k : -((-a + k - 1) / k);
 
 static uint32_t s_big[NES_W * SCALE_MAX * NES_H * SCALE_MAX];
 static int s_col_native[NES_W * SCALE_MAX], s_col_bg[NES_W * SCALE_MAX];
+
+static uint8_t s_big_op[NES_W * SCALE_MAX * NES_H * SCALE_MAX];   /* background opacity per output pixel */
+static uint8_t s_taken[NES_W * SCALE_MAX * NES_H * SCALE_MAX];
+
+/* Every sprite of the frame into the scaled picture over the background in
+ * out, each at its player's glided position moved with the camera (fx, fy:
+ * the camera's shift, native px), in s_slots order (the first to cover a
+ * pixel decides it, even a sprite behind the background). */
+static void glide_draw(uint32_t *out, const uint8_t *op, int ow, int oh, int k, Crop c, double fx, double fy)
+{
+    memset(s_taken, 0, (size_t)ow * (size_t)oh);
+    const uint8_t *oam = cyc_render_oam();
+    for (int i = 0; i < s_nslots; ++i) {
+        int slot = s_slots[i];
+        const uint8_t *o = oam + slot * 4;
+        int ytop = o[0] + 1;
+        int ln = clampi(ytop, 0, NES_H - 1);
+        if (!(cyc_render_line_mask(ln) & 0x10)) continue;
+        bool tall = cyc_render_line_sprite16(ln);
+        uint16_t table = cyc_render_line_sprite_table(ln);
+        int rows = tall ? 16 : 8;
+        double gx = 0, gy = 0;
+        if (s_gl_ok[slot]) {
+            double t = s_glide == GLIDE_SMOOTH ? -(1.0 - s_phase) : s_phase;
+            gx = s_gdx[slot] * t;
+            gy = s_gdy[slot] * t;
+        }
+        int x0 = o[3] * k + (int)lround((fx + gx) * k) - c.left * k;
+        int y0 = ytop * k + (int)lround((fy + gy) * k) - c.top * k;
+        unsigned attr = o[2];
+        for (int r = 0; r < rows; ++r) {
+            int row = (attr & 0x80) ? rows - 1 - r : r;
+            uint16_t pattern = sprite_pattern(o, tall, table, row);
+            uint8_t lo = cyc_render_chr((uint16_t)(pattern + (row & 7)));
+            uint8_t hi = cyc_render_chr((uint16_t)(pattern + (row & 7) + 8));
+            if (!(lo | hi)) continue;
+            for (int cc = 0; cc < 8; ++cc) {
+                int bit = (attr & 0x40) ? cc : 7 - cc;
+                int v = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+                if (!v) continue;
+                uint32_t colour = sprite_colour(slot, attr, v);
+                for (int yy = y0 + r * k; yy < y0 + (r + 1) * k; ++yy) {
+                    if (yy < 0 || yy >= oh) continue;
+                    for (int xx = x0 + cc * k; xx < x0 + (cc + 1) * k; ++xx) {
+                        if (xx < 0 || xx >= ow) continue;
+                        size_t at = (size_t)yy * (size_t)ow + (size_t)xx;
+                        if (s_taken[at]) continue;
+                        s_taken[at] = 1;
+                        if ((attr & 0x20) && op[at]) continue;
+                        out[at] = colour;
+                    }
+                }
+            }
+        }
+    }
+}
 
 static const uint32_t *present(void *ctx, int *width, int *height)
 {
@@ -401,7 +556,8 @@ static const uint32_t *present(void *ctx, int *width, int *height)
         fy = fy < -s_margin ? -s_margin : fy > s_margin ? s_margin : fy;
     }
     int kx = (int)lround(fx * k), ky = (int)lround(fy * k);
-    bool layers = s_have_layers && (kx || ky || s_unlimit);
+    bool glide = s_glide != GLIDE_OFF && s_present_rate > 60 && s_have_layers;
+    bool layers = s_have_layers && (kx || ky || s_unlimit || glide);
     if (!layers && k == 1 && !c.top && !c.bottom && !c.left && !c.right) return NULL;
 
     int ow = (NES_W - c.left - c.right) * k, oh = (NES_H - c.top - c.bottom) * k;
@@ -426,6 +582,15 @@ static const uint32_t *present(void *ctx, int *width, int *height)
         const uint8_t *op = opaque + by * NES_W;
         const uint8_t *at = s_layer_at + yn * NES_W;
         const uint32_t *sc = s_layer + yn * NES_W;
+        if (glide) {
+            uint8_t *bo = s_big_op + (size_t)y * (size_t)ow;
+            for (int x = 0; x < ow; ++x) {
+                int bx = in_pf ? s_col_bg[x] : s_col_native[x];
+                out[x] = bg[bx];
+                bo[x] = op[bx];
+            }
+            continue;
+        }
         for (int x = 0; x < ow; ++x) {
             int bx = in_pf ? s_col_bg[x] : s_col_native[x];
             int sx = s_col_native[x];
@@ -434,6 +599,7 @@ static const uint32_t *present(void *ctx, int *width, int *height)
             out[x] = px;
         }
     }
+    if (glide) glide_draw(s_big, s_big_op, ow, oh, k, c, pf ? fx : 0, pf ? fy : 0);
     *width = ow;
     *height = oh;
     return s_big;
@@ -471,6 +637,8 @@ static void load_setting(void *ctx, const char *key, const char *value)
     else if (!strcmp(key, "SpriteOrder"))    s_order = s_order_saved = clampi(v, 0, 1);
     else if (!strcmp(key, "PresentRate"))    s_present_rate = s_rate_saved = clampi(v, 0, 1000);
     else if (!strcmp(key, "FlashSoften"))    s_soft = s_soft_saved = clampi(v, 0, SOFT_MODES - 1);
+    else if (!strcmp(key, "FlashColour"))    s_tint = s_tint_saved = clampi(v, 0, TINT_COUNT - 1);
+    else if (!strcmp(key, "CharGlide"))      s_glide = s_glide_saved = clampi(v, 0, GLIDE_MODES - 1);
     else if (!strcmp(key, "PresentScale"))   s_scale = s_scale_saved = clampi(v, 1, SCALE_MAX);
     s_crop = s_crop_saved;
 }
@@ -487,6 +655,8 @@ static void save_settings(void *ctx, FILE *f)
     fprintf(f, "NoSpriteLimit = %d\n", s_unlimit_saved);
     fprintf(f, "SpriteOrder = %d\n", s_order_saved);
     fprintf(f, "FlashSoften = %d\n", s_soft_saved);
+    fprintf(f, "FlashColour = %d\n", s_tint_saved);
+    fprintf(f, "CharGlide = %d\n", s_glide_saved);
     fprintf(f, "PresentRate = %d\n", s_rate_saved);
     fprintf(f, "PresentScale = %d\n", s_scale_saved);
 }
@@ -552,6 +722,7 @@ static void frame_end(void *ctx)
     int ox = bos_smooth_frame(&s_smx, on, dx);
     int oy = bos_smooth_frame(&s_smy, on, dy);
     flash_frame(on, dx, dy);
+    glide_frame(on, dx, dy);
 
     if (s_oam_log) {
         const uint8_t *oam = cyc_render_oam();
@@ -565,8 +736,8 @@ static void frame_end(void *ctx)
     int n = 0;
     for (int i = 0; i < 64; ++i) n += oam[i * 4] < 0xEF;
     if (!on) { fprintf(s_log, "%6ld  off  %3d  %3d\n", f, n, busiest_line()); fflush(s_log); return; }
-    fprintf(s_log, "%6ld  %4d  %+3d  %4d  %+3d  %3d  %3d  %3d  %3d  %+2d  %+2d  %2d\n",
-            f, x, dx, y, dy, s_top, s_bot, n, busiest_line(), ox, oy, s_flashing);
+    fprintf(s_log, "%6ld  %4d  %+3d  %4d  %+3d  %3d  %3d  %3d  %3d  %+2d  %+2d  %2d  %2d\n",
+            f, x, dx, y, dy, s_top, s_bot, n, busiest_line(), ox, oy, s_flashing, s_gliding);
     fflush(s_log);
 }
 
@@ -580,7 +751,9 @@ static const CycHostOption s_options[] = {
     { "--smooth-margin",   true, "N: smoothing margin in px, 1-12 (default 3)" },
     { "--no-sprite-limit", true, "0|1: draw every sprite (no flicker) for this run" },
     { "--sprite-order",    true, "0|1: overlaps in the game's order / lower on screen in front" },
-    { "--flash-soften",    true, "0|1|2|3: player flash as the game / soft / none / slow pulse" },
+    { "--flash-soften",    true, "0-4: player flash as the game / soft / none / slow pulse / steady glow" },
+    { "--flash-colour",    true, "0-5: highlight colour: game's white / gold / blue / green / pink / lavender" },
+    { "--char-glide",      true, "0|1|2: players glide off / smooth (1/60 s behind) / low lag (predicts)" },
     { "--present-rate",    true, "N: pictures per second, e.g. 120 or 240 (0: one per frame)" },
     { "--present-scale",   true, "K: picture scale 1-6 (default 4)" },
 };
@@ -604,7 +777,7 @@ static bool option(void *ctx, const char *name, const char *value)
         *fp = fopen(value, "w");
         if (!*fp) { perror(value); return false; }
         if (scroll)
-            fprintf(*fp, "# frame  scrollX  dx  scrollY  dy  top  bottom  sprites  busiestLine  shiftX  shiftY  flashing\n");
+            fprintf(*fp, "# frame  scrollX  dx  scrollY  dy  top  bottom  sprites  busiestLine  shiftX  shiftY  flashing  gliding\n");
         return true;
     }
     if (!strcmp(name, "--scroll-line"))    return parse_int(value, 1, NES_H - 2, &s_line);
@@ -613,6 +786,8 @@ static bool option(void *ctx, const char *name, const char *value)
     if (!strcmp(name, "--smooth-margin"))  return parse_int(value, 1, BOS_SMOOTH_MARGIN_MAX, &s_margin);
     if (!strcmp(name, "--no-sprite-limit")) return parse_int(value, 0, 1, &s_unlimit);
     if (!strcmp(name, "--sprite-order"))   return parse_int(value, 0, 1, &s_order);
+    if (!strcmp(name, "--char-glide"))     return parse_int(value, 0, GLIDE_MODES - 1, &s_glide);
+    if (!strcmp(name, "--flash-colour"))   return parse_int(value, 0, TINT_COUNT - 1, &s_tint);
     if (!strcmp(name, "--flash-soften"))   return parse_int(value, 0, SOFT_MODES - 1, &s_soft);
     if (!strcmp(name, "--present-scale"))  return parse_int(value, 1, SCALE_MAX, &s_scale);
     if (!strcmp(name, "--present-rate")) {
@@ -630,9 +805,11 @@ static bool option(void *ctx, const char *name, const char *value)
 
 static const char *const RATE_CHOICES[] = { "60 (off)", "120", "180", "240" };
 static const int RATE_VALUES[] = { 0, 120, 180, 240 };
+static const char *const GLIDE_CHOICES[] = { "Off", "Smooth", "Low lag" };
 static const char *const ORDER_CHOICES[] = { "Game's order", "Lower on screen in front" };
-static const char *const SOFT_CHOICES[] = { "Off (as the game)", "Soft", "Slow pulse", "None" };
-static const int SOFT_VALUES[] = { SOFT_OFF, SOFT_SOFT, SOFT_PULSE, SOFT_NONE };
+static const char *const SOFT_CHOICES[] = { "Off (as the game)", "Soft", "Slow pulse", "Steady glow", "None" };
+static const int SOFT_VALUES[] = { SOFT_OFF, SOFT_SOFT, SOFT_PULSE, SOFT_STEADY, SOFT_NONE };
+static const char *const TINT_CHOICES[] = { "Game's white", "Gold", "Sky blue", "Green", "Pink", "Lavender" };
 static const char *const CROP_CHOICES[] = { "Off", "Standard", "More", "Custom (config.ini)" };
 static const Crop CROP_PRESETS[] = { { 0, 0, 0, 0 }, { 8, 8, 8, 8 }, { 12, 12, 12, 12 } };
 
@@ -644,13 +821,21 @@ static const RecompRuntimeUiItem s_menu[] = {
       "Extra pictures between the NES's 60 frames: the camera moves a fraction of a pixel in each. "
       "Pick your monitor's refresh rate or lower (180 suits a 240 Hz FreeSync monitor).",
       RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, RATE_CHOICES, 4, RATE_VALUES },
+    { "bos.glide", "Smooth motion", "Player glide",
+      "With 120/180/240 pictures per second, players glide between the game's positions instead of hopping. "
+      "Smooth: steadiest, drawn up to 1/60 s behind. Low lag: no delay, can wobble a hair when a player turns.",
+      RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, GLIDE_CHOICES, 3, NULL },
     { "bos.unlimit", "Picture", "No sprite flicker",
       "Draws every sprite every frame instead of the NES's 8 per line, so players stop flashing.",
       RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
     { "bos.soften", "Picture", "Player flashing",
       "The game flashes the player with the puck bright white 10 times a second. Slow pulse: he fades "
-      "gently in and out instead. Soft: a faint fast flash. None: no flash at all.",
-      RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, SOFT_CHOICES, 4, SOFT_VALUES },
+      "gently in and out instead. Steady glow: a calm constant colour, no flashing. Soft: a faint fast flash. "
+      "None: no highlight at all.",
+      RECOMP_RUNTIME_UI_CHOICE, 0, 4, 1, SOFT_CHOICES, 5, SOFT_VALUES },
+    { "bos.tint", "Picture", "Highlight colour",
+      "The colour of the puck carrier's highlight (Soft, Slow pulse, Steady glow).",
+      RECOMP_RUNTIME_UI_CHOICE, 0, 5, 1, TINT_CHOICES, 6, NULL },
     { "bos.order", "Picture", "Overlapping sprites",
       "Which sprite is in front where two overlap (with No sprite flicker on).",
       RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, ORDER_CHOICES, 2, NULL },
@@ -682,6 +867,8 @@ static int menu_get(void *ctx, const RecompRuntimeUiItem *it, int *out)
     else if (key_is(it, "bos.unlimit")) *out = s_unlimit;
     else if (key_is(it, "bos.order")) *out = s_order;
     else if (key_is(it, "bos.soften")) *out = s_soft;
+    else if (key_is(it, "bos.glide")) *out = s_glide;
+    else if (key_is(it, "bos.tint")) *out = s_tint;
     else if (key_is(it, "bos.crop")) *out = crop_preset();
     else return 0;
     return 1;
@@ -697,6 +884,8 @@ static int menu_set(void *ctx, const RecompRuntimeUiItem *it, int v)
     }
     else if (key_is(it, "bos.unlimit")) { s_unlimit = s_unlimit_saved = v != 0; s_prepared = -1; }
     else if (key_is(it, "bos.order")) { s_order = s_order_saved = clampi(v, 0, 1); s_prepared = -1; }
+    else if (key_is(it, "bos.glide")) s_glide = s_glide_saved = clampi(v, 0, GLIDE_MODES - 1);
+    else if (key_is(it, "bos.tint")) { s_tint = s_tint_saved = clampi(v, 0, TINT_COUNT - 1); s_prepared = -1; }
     else if (key_is(it, "bos.soften")) { s_soft = s_soft_saved = clampi(v, 0, SOFT_MODES - 1); s_prepared = -1; }
     else if (key_is(it, "bos.crop")) {
         if (v < 0 || v > 2) return 0;              /* Custom: edit config.ini */
@@ -710,6 +899,8 @@ static int menu_enabled(void *ctx, const RecompRuntimeUiItem *it)
 {
     (void)ctx;
     if (key_is(it, "bos.order")) return s_unlimit;
+    if (key_is(it, "bos.glide")) return s_present_rate > 60;
+    if (key_is(it, "bos.tint")) return s_soft != SOFT_OFF && s_soft != SOFT_NONE;
     return 1;
 }
 
