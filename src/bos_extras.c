@@ -30,10 +30,9 @@
  *                 highlight's colour, 0 the game's white, 1 (default) gold,
  *                 2 sky blue, 3 green, 4 pink, 5 lavender.
  *
- *   Smooth camera [Game] SmoothCamera (default 1): evens out the camera's
- *                 steps by shifting the rink by up to SmoothMargin px (3);
- *                 the crop grows by that margin so no undrawn edge shows.
- *                 Sprites stay where the game drew them.
+ *   Smooth camera [Game] SmoothCamera: 0 off, 1 quick, 2 (default) gentle, 3 softest.
+ *                 An eased camera (see "the eased camera" below); vertical
+ *                 steps use a small smoother (SmoothMargin px, cropped).
  *
  *   Player glide  [Game] CharGlide: with PresentRate above 60, players glide
  *                 between the game's 60 Hz positions. 0 off, 1 (default)
@@ -70,7 +69,7 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v;
 typedef struct { int top, bottom, left, right; } Crop;
 #define BOS_DEFAULT_CROP { 8, 8, 8, 8 }
 static Crop s_crop_saved = BOS_DEFAULT_CROP, s_crop = BOS_DEFAULT_CROP;
-static int  s_smooth_saved = 1, s_smooth = 1;
+static int  s_smooth_saved = 2, s_smooth = 2;   /* 0 off, 1 quick, 2 gentle */
 static int  s_unlimit_saved = 1, s_unlimit = 1;
 static int  s_order_saved = 1, s_order = 1;
 static int  s_rate_saved, s_present_rate;
@@ -80,7 +79,7 @@ static int  s_margin_saved = BOS_SMOOTH_MARGIN, s_margin = BOS_SMOOTH_MARGIN;
 /* ---- per-frame state ---- */
 static CycHostExtras s_extras;              /* defined at the end */
 static int           s_line = 120;          /* playfield line sampled */
-static BosSmooth     s_smx, s_smy;
+static BosSmooth     s_smy;             /* vertical: the small-margin smoother */
 static int           s_prev_x = -1, s_prev_y = -1;
 static int           s_top = -1, s_bot = -1; /* playfield rows [s_top, s_bot) */
 static double        s_phase;               /* fraction of a frame since the machine frame */
@@ -108,6 +107,35 @@ static void find_playfield(void)
     if (b - t < MIN_PLAYFIELD) return;
     s_top = t;
     s_bot = b;
+}
+
+/* ---- the frame's snapshot ----
+ * Everything an in-between picture needs, copied when the machine frame
+ * ends (prepare). The window runs the next machine frame on another thread
+ * while it shows in-between pictures (present_from_snapshot), so present
+ * reads only this, never the live machine. */
+static uint32_t s_snap_native[NES_W * NES_H];
+static uint8_t  s_snap_bgop[NES_W * NES_H];
+static uint8_t  s_snap_oam[256];
+static uint8_t  s_snap_chr[0x2000];
+static uint8_t  s_snap_mask[NES_H], s_snap_tall[NES_H];
+static uint16_t s_snap_table[NES_H];
+static int      s_snap_sx[NES_H];
+static uint32_t s_snap_col[32];
+
+static void snapshot(const uint32_t *native)
+{
+    memcpy(s_snap_native, native, sizeof(s_snap_native));
+    memcpy(s_snap_bgop, cyc_frame_bg_opaque(), sizeof(s_snap_bgop));
+    memcpy(s_snap_oam, cyc_render_oam(), sizeof(s_snap_oam));
+    for (int a = 0; a < 0x2000; ++a) s_snap_chr[a] = cyc_render_chr((uint16_t)a);
+    for (int y = 0; y < NES_H; ++y) {
+        s_snap_mask[y] = cyc_render_line_mask(y);
+        s_snap_tall[y] = cyc_render_line_sprite16(y);
+        s_snap_table[y] = cyc_render_line_sprite_table(y);
+        s_snap_sx[y] = cyc_render_line_scroll_x(y);
+    }
+    for (int i = 0; i < 32; ++i) s_snap_col[i] = cyc_render_color(i);
 }
 
 /* ---- flash softening (FlashSoften) ----
@@ -235,10 +263,10 @@ static bool flash_touched(int slot)
 
 static uint32_t sprite_colour(int slot, unsigned attr, int v)
 {
-    uint32_t c = cyc_render_color(16 + (int)(attr & 3) * 4 + v);
+    uint32_t c = s_snap_col[16 + (int)(attr & 3) * 4 + v];
     if (!flash_touched(slot)) return c;
-    uint32_t own = cyc_render_color(16 + s_own[slot] * 4 + v);
-    uint32_t flash = s_tint ? TINTS[s_tint] : cyc_render_color(16 + 3 * 4 + v);
+    uint32_t own = s_snap_col[16 + s_own[slot] * 4 + v];
+    uint32_t flash = s_tint ? TINTS[s_tint] : s_snap_col[16 + 3 * 4 + v];
     if (s_soft == SOFT_NONE) return own;
     if (s_soft == SOFT_SOFT) return mix(own, flash, FLASH_SOFT_PERCENT);
     if (s_soft == SOFT_STEADY) return mix(own, flash, STEADY_PERCENT);
@@ -465,17 +493,105 @@ static int busiest_line(void)
 static long s_prepared = -1;
 static bool s_have_layers;
 
+static void build_world(void);
+
 static void prepare(const uint32_t *native)
 {
     s_prepared = s_frame;
+    snapshot(native);
     s_have_layers = cyc_render_background(s_bg);
     if (!s_have_layers) return;
     sprite_order();
+    if (s_smooth) build_world();
     if (s_unlimit) sprite_layer_all(0, NES_H);
     else sprite_layer_native(native, 0, NES_H);
 }
 
 static int floordiv(int a, int k) { return a >= 0 ? a / k : -((-a + k - 1) / k); }
+
+/* ---- the eased camera (SmoothCamera) ----
+ * Measured (scroll.log): when the puck is shot down the ice the game's
+ * camera goes from 2 px a frame to 7 at once, skips some frames on the way
+ * (-7 0 -7 -7 0) and stops dead. The picture's camera follows it with a
+ * limited acceleration (SmoothCamera 1 quick, 2 gentle, 3 softest): it speeds up
+ * gradually, rides through the skipped frames, and brakes along a curve that
+ * ends exactly on the game's camera, never past it. While it trails, the
+ * columns the game has already scrolled away are drawn from the nametables
+ * (VRAM still holds them; the game only rewrites the column 256 px ahead),
+ * so nothing extra is cropped. */
+enum { CAM_CUT = 16, CAM_LAG_MAX = 96 };
+static const double CAM_ACCEL[] = { 0, 1.6, 1.0, 0.8 };   /* px/frame per frame, by SmoothCamera */
+typedef struct { bool have; double cam, x, v, px; } CamFollow;
+static CamFollow s_cam;
+
+static void cam_frame(bool on, int dx)
+{
+    CamFollow *c = &s_cam;
+    if (!on || !s_smooth || !c->have || dx > CAM_CUT || dx < -CAM_CUT) {
+        *c = (CamFollow){ on, 0, 0, 0, 0 };
+        return;
+    }
+    double a = CAM_ACCEL[clampi(s_smooth, 1, 3)];
+    c->px = c->x;
+    c->cam += dx;
+    double e = c->cam - c->x, d = fabs(e);
+    /* The fastest speed that can still brake to a stop in distance d at
+     * this acceleration (steps v, v-a, v-2a, ...). */
+    double vd = sqrt(a * a / 4 + 2 * a * d) - a / 2;
+    if (e < 0) vd = -vd;
+    double dv = vd - c->v;
+    c->v += dv > a ? a : dv < -a ? -a : dv;
+    if ((e > 0 && c->v > e) || (e < 0 && c->v < e)) c->v = e;     /* land on it, never past */
+    c->x += c->v;
+    e = c->cam - c->x;
+    if (e > CAM_LAG_MAX) c->x = c->cam - CAM_LAG_MAX;
+    if (e < -CAM_LAG_MAX) c->x = c->cam + CAM_LAG_MAX;
+}
+
+/* The picture's shift (native px: draw native column x - shift at screen
+ * column x) a fraction p of a frame after the machine frame. Between frames
+ * the camera moves from the previous frame's position to this one's. */
+static double cam_shift(double p)
+{
+    if (!s_cam.have) return 0;
+    double xd = s_present_rate > 60 ? s_cam.px + (s_cam.x - s_cam.px) * p : s_cam.x;
+    return s_cam.cam - xd;
+}
+
+/* The background of both nametables, 512 wide, for every line as the PPU
+ * scrolled it (its Y and pattern table): columns off the native picture. */
+static uint32_t s_world[NES_H * SCROLL_W];
+static uint8_t  s_world_op[NES_H * SCROLL_W];
+
+static void build_world(void)
+{
+    uint32_t univ = cyc_render_color(0);
+    for (int py = 0; py < NES_H; ++py) {
+        uint32_t *row = s_world + py * SCROLL_W;
+        uint8_t *op = s_world_op + py * SCROLL_W;
+        if (!(cyc_render_line_mask(py) & 0x08)) {
+            for (int x = 0; x < SCROLL_W; ++x) { row[x] = univ; op[x] = 0; }
+            continue;
+        }
+        int wy = cyc_render_line_scroll_y(py);
+        int nty = wy >= 240 ? 2 : 0, yy = wy % 240, ty = yy >> 3, fine = yy & 7;
+        uint16_t table = cyc_render_line_bg_table(py);
+        for (int tx = 0; tx < 64; ++tx) {
+            int cx = tx & 31;
+            uint16_t base = (uint16_t)(0x2000 + (nty + (tx >> 5)) * 0x400);
+            uint8_t tile = cyc_render_nametable((uint16_t)(base + ty * 32 + cx));
+            uint8_t ab = cyc_render_nametable((uint16_t)(base + 0x3C0 + (ty >> 2) * 8 + (cx >> 2)));
+            int pal = (ab >> (((ty & 2) << 1) | (cx & 2))) & 3;
+            uint8_t lo = cyc_render_chr((uint16_t)(table + tile * 16 + fine));
+            uint8_t hi = cyc_render_chr((uint16_t)(table + tile * 16 + fine + 8));
+            for (int b = 0; b < 8; ++b) {
+                int v = ((lo >> (7 - b)) & 1) | (((hi >> (7 - b)) & 1) << 1);
+                row[tx * 8 + b] = v ? cyc_render_color(pal * 4 + v) : univ;
+                op[tx * 8 + b] = (uint8_t)(v != 0);
+            }
+        }
+    }
+}
 
 static uint32_t s_big[NES_W * SCALE_MAX * NES_H * SCALE_MAX];
 static int s_col_native[NES_W * SCALE_MAX], s_col_bg[NES_W * SCALE_MAX];
@@ -487,21 +603,21 @@ static uint8_t s_taken[NES_W * SCALE_MAX * NES_H * SCALE_MAX];
  * out, each at its player's glided position moved with the camera (fx, fy:
  * the camera's shift, native px), in s_slots order (the first to cover a
  * pixel decides it, even a sprite behind the background). */
-static void glide_draw(uint32_t *out, const uint8_t *op, int ow, int oh, int k, Crop c, double fx, double fy)
+static void glide_draw(uint32_t *out, const uint8_t *op, int ow, int oh, int k, Crop c, double fx, double fy, bool move)
 {
     memset(s_taken, 0, (size_t)ow * (size_t)oh);
-    const uint8_t *oam = cyc_render_oam();
+    const uint8_t *oam = s_snap_oam;
     for (int i = 0; i < s_nslots; ++i) {
         int slot = s_slots[i];
         const uint8_t *o = oam + slot * 4;
         int ytop = o[0] + 1;
         int ln = clampi(ytop, 0, NES_H - 1);
-        if (!(cyc_render_line_mask(ln) & 0x10)) continue;
-        bool tall = cyc_render_line_sprite16(ln);
-        uint16_t table = cyc_render_line_sprite_table(ln);
+        if (!(s_snap_mask[ln] & 0x10)) continue;
+        bool tall = s_snap_tall[ln];
+        uint16_t table = s_snap_table[ln];
         int rows = tall ? 16 : 8;
         double gx = 0, gy = 0;
-        if (s_gl_ok[slot]) {
+        if (move && s_gl_ok[slot]) {
             double t = s_glide == GLIDE_SMOOTH ? -(1.0 - s_phase) : s_phase;
             gx = s_gdx[slot] * t;
             gy = s_gdy[slot] * t;
@@ -512,8 +628,8 @@ static void glide_draw(uint32_t *out, const uint8_t *op, int ow, int oh, int k, 
         for (int r = 0; r < rows; ++r) {
             int row = (attr & 0x80) ? rows - 1 - r : r;
             uint16_t pattern = sprite_pattern(o, tall, table, row);
-            uint8_t lo = cyc_render_chr((uint16_t)(pattern + (row & 7)));
-            uint8_t hi = cyc_render_chr((uint16_t)(pattern + (row & 7) + 8));
+            uint8_t lo = s_snap_chr[(pattern + (row & 7)) & 0x1FFF];
+            uint8_t hi = s_snap_chr[(pattern + (row & 7) + 8) & 0x1FFF];
             if (!(lo | hi)) continue;
             for (int cc = 0; cc < 8; ++cc) {
                 int bit = (attr & 0x40) ? cc : 7 - cc;
@@ -539,34 +655,45 @@ static void glide_draw(uint32_t *out, const uint8_t *op, int ow, int oh, int k, 
 static const uint32_t *present(void *ctx, int *width, int *height)
 {
     (void)ctx;
-    int w, h;
-    const uint32_t *native = cyc_render_present(&w, &h);
-    if (!native || w != NES_W || h != NES_H) return NULL;
-    if (s_prepared != s_frame) prepare(native);
+    const uint32_t *native = s_snap_native;
+    if (s_prepared != s_frame) {
+        /* Not prepared at the frame's end (60 pictures a second): the
+         * machine is idle now, so prepare from it. */
+        int w, h;
+        const uint32_t *live = cyc_render_present(&w, &h);
+        if (!live || w != NES_W || h != NES_H) return NULL;
+        prepare(live);
+    }
 
     int k = s_scale;
     Crop c = s_crop;
-    if (s_smooth) { c.left += s_margin; c.right += s_margin; c.top += s_margin; c.bottom += s_margin; }
+    if (s_smooth) { c.top += s_margin; c.bottom += s_margin; }   /* vertical: the small smoother */
     bool pf = s_smooth && s_top >= 0;
-    double fx = 0, fy = 0;
+    double fx = 0, fy = 0, fx0 = 0;
     if (pf) {
-        fx = s_smx.off - s_smx.vel * s_phase;
+        fx = cam_shift(s_phase);
+        fx0 = cam_shift(0);
         fy = s_smy.off - s_smy.vel * s_phase;
-        fx = fx < -s_margin ? -s_margin : fx > s_margin ? s_margin : fx;
         fy = fy < -s_margin ? -s_margin : fy > s_margin ? s_margin : fy;
     }
     int kx = (int)lround(fx * k), ky = (int)lround(fy * k);
     bool glide = s_glide != GLIDE_OFF && s_present_rate > 60 && s_have_layers;
-    bool layers = s_have_layers && (kx || ky || s_unlimit || glide);
-    if (!layers && k == 1 && !c.top && !c.bottom && !c.left && !c.right) return NULL;
+    /* Sprites one by one (moved with the camera, and gliding): */
+    bool draw = s_have_layers && (glide || (pf && (kx || ky || lround(fx0 * k))));
+    bool layers = s_have_layers && (kx || ky || s_unlimit || draw);
+    if (!layers && k == 1 && !c.top && !c.bottom && !c.left && !c.right) {
+        *width = NES_W;
+        *height = NES_H;
+        return s_snap_native;
+    }
 
     int ow = (NES_W - c.left - c.right) * k, oh = (NES_H - c.top - c.bottom) * k;
     if (ow <= 0 || oh <= 0) return NULL;
-    const uint8_t *opaque = cyc_frame_bg_opaque();
+    const uint8_t *opaque = s_snap_bgop;
     for (int x = 0; x < ow; ++x) {
         int gx = c.left * k + x;
         s_col_native[x] = gx / k;
-        s_col_bg[x] = clampi(floordiv(gx - kx, k), 0, NES_W - 1);
+        s_col_bg[x] = floordiv(gx - kx, k);              /* may fall off the native picture */
     }
     for (int y = 0; y < oh; ++y) {
         int gy = c.top * k + y, yn = gy / k;
@@ -580,26 +707,26 @@ static const uint32_t *present(void *ctx, int *width, int *height)
         int by = in_pf ? clampi(floordiv(gy - ky, k), s_top, s_bot - 1) : yn;
         const uint32_t *bg = s_bg + by * NES_W;
         const uint8_t *op = opaque + by * NES_W;
+        const uint32_t *wrow = s_world + by * SCROLL_W;
+        const uint8_t *wop = s_world_op + by * SCROLL_W;
+        int wx0 = s_snap_sx[by];
         const uint8_t *at = s_layer_at + yn * NES_W;
         const uint32_t *sc = s_layer + yn * NES_W;
-        if (glide) {
-            uint8_t *bo = s_big_op + (size_t)y * (size_t)ow;
-            for (int x = 0; x < ow; ++x) {
-                int bx = in_pf ? s_col_bg[x] : s_col_native[x];
-                out[x] = bg[bx];
-                bo[x] = op[bx];
-            }
-            continue;
-        }
+        uint8_t *bo = s_big_op + (size_t)y * (size_t)ow;
         for (int x = 0; x < ow; ++x) {
             int bx = in_pf ? s_col_bg[x] : s_col_native[x];
+            uint32_t px;
+            uint8_t o;
+            if (bx >= 0 && bx < NES_W) { px = bg[bx]; o = op[bx]; }
+            else if (s_smooth) { int wx = (wx0 + bx) & (SCROLL_W - 1); px = wrow[wx]; o = wop[wx]; }
+            else { int cx = clampi(bx, 0, NES_W - 1); px = bg[cx]; o = op[cx]; }
+            if (draw) { out[x] = px; bo[x] = o; continue; }
             int sx = s_col_native[x];
-            uint32_t px = bg[bx];
-            if (at[sx] == 1 || (at[sx] == 2 && !op[bx])) px = sc[sx];
+            if (at[sx] == 1 || (at[sx] == 2 && !o)) px = sc[sx];
             out[x] = px;
         }
     }
-    if (glide) glide_draw(s_big, s_big_op, ow, oh, k, c, pf ? fx : 0, pf ? fy : 0);
+    if (draw) glide_draw(s_big, s_big_op, ow, oh, k, c, pf ? (glide ? fx : fx0) : 0, pf ? fy : 0, glide);
     *width = ow;
     *height = oh;
     return s_big;
@@ -631,7 +758,7 @@ static void load_setting(void *ctx, const char *key, const char *value)
     else if (!strcmp(key, "OverscanBottom")) s_crop_saved.bottom = clampi(v, 0, CROP_MAX);
     else if (!strcmp(key, "OverscanLeft"))   s_crop_saved.left = clampi(v, 0, CROP_MAX);
     else if (!strcmp(key, "OverscanRight"))  s_crop_saved.right = clampi(v, 0, CROP_MAX);
-    else if (!strcmp(key, "SmoothCamera"))   s_smooth = s_smooth_saved = v != 0;
+    else if (!strcmp(key, "SmoothCamera"))   s_smooth = s_smooth_saved = clampi(v, 0, 3);
     else if (!strcmp(key, "SmoothMargin"))   s_margin = s_margin_saved = clampi(v, 1, BOS_SMOOTH_MARGIN_MAX);
     else if (!strcmp(key, "NoSpriteLimit"))  s_unlimit = s_unlimit_saved = v != 0;
     else if (!strcmp(key, "SpriteOrder"))    s_order = s_order_saved = clampi(v, 0, 1);
@@ -667,10 +794,9 @@ static FILE *s_log, *s_oam_log;
 static void restart(void)
 {
     s_prev_x = s_prev_y = -1;
-    bos_smooth_set_margin(&s_smx, s_margin, false);
     bos_smooth_set_margin(&s_smy, s_margin, false);
-    bos_smooth_reset(&s_smx);
     bos_smooth_reset(&s_smy);
+    s_cam = (CamFollow){ false, 0, 0, 0, 0 };
 }
 
 static void power_on(void *ctx)
@@ -719,10 +845,18 @@ static void frame_end(void *ctx)
     int dy = on && s_prev_y >= 0 ? wrap_step(y - s_prev_y, SCROLL_H) : 0;
     s_prev_x = on ? x : -1;
     s_prev_y = on ? y : -1;
-    int ox = bos_smooth_frame(&s_smx, on, dx);
+    cam_frame(on, dx);
+    int ox = (int)lround(s_cam.cam - s_cam.x);   /* how far the picture's camera trails */
     int oy = bos_smooth_frame(&s_smy, on, dy);
     flash_frame(on, dx, dy);
     glide_frame(on, dx, dy);
+    if (s_present_rate > 60) {
+        /* In-between pictures may be drawn while the next frame runs on
+         * another thread: take the snapshot now, while the machine is idle. */
+        int w, h;
+        const uint32_t *live = cyc_render_present(&w, &h);
+        if (live && w == NES_W && h == NES_H) prepare(live);
+    }
 
     if (s_oam_log) {
         const uint8_t *oam = cyc_render_oam();
@@ -747,7 +881,7 @@ static const CycHostOption s_options[] = {
     { "--oam-log",         true, "FILE: the frame's 64 sprite entries (Y tile attr X, hex) every frame" },
     { "--scroll-line",     true, "N: playfield line the scroll is sampled on (default 120)" },
     { "--overscan",        true, "T,B,L,R: crop this many pixels for this run" },
-    { "--smooth",          true, "0|1: camera smoothing for this run" },
+    { "--smooth",          true, "0-3: eased camera off / quick / gentle / softest for this run" },
     { "--smooth-margin",   true, "N: smoothing margin in px, 1-12 (default 3)" },
     { "--no-sprite-limit", true, "0|1: draw every sprite (no flicker) for this run" },
     { "--sprite-order",    true, "0|1: overlaps in the game's order / lower on screen in front" },
@@ -782,7 +916,7 @@ static bool option(void *ctx, const char *name, const char *value)
     }
     if (!strcmp(name, "--scroll-line"))    return parse_int(value, 1, NES_H - 2, &s_line);
     if (!strcmp(name, "--overscan"))       return parse_crop(value, &s_crop);
-    if (!strcmp(name, "--smooth"))         return parse_int(value, 0, 1, &s_smooth);
+    if (!strcmp(name, "--smooth"))         return parse_int(value, 0, 3, &s_smooth);
     if (!strcmp(name, "--smooth-margin"))  return parse_int(value, 1, BOS_SMOOTH_MARGIN_MAX, &s_margin);
     if (!strcmp(name, "--no-sprite-limit")) return parse_int(value, 0, 1, &s_unlimit);
     if (!strcmp(name, "--sprite-order"))   return parse_int(value, 0, 1, &s_order);
@@ -805,6 +939,7 @@ static bool option(void *ctx, const char *name, const char *value)
 
 static const char *const RATE_CHOICES[] = { "60 (off)", "120", "180", "240" };
 static const int RATE_VALUES[] = { 0, 120, 180, 240 };
+static const char *const CAM_CHOICES[] = { "Off", "Quick", "Gentle", "Softest" };
 static const char *const GLIDE_CHOICES[] = { "Off", "Smooth", "Low lag" };
 static const char *const ORDER_CHOICES[] = { "Game's order", "Lower on screen in front" };
 static const char *const SOFT_CHOICES[] = { "Off (as the game)", "Soft", "Slow pulse", "Steady glow", "None" };
@@ -815,8 +950,10 @@ static const Crop CROP_PRESETS[] = { { 0, 0, 0, 0 }, { 8, 8, 8, 8 }, { 12, 12, 1
 
 static const RecompRuntimeUiItem s_menu[] = {
     { "bos.smooth", "Smooth motion", "Smooth camera",
-      "Evens out the rink's scrolling steps (sprites stay where the game drew them).",
-      RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+      "Eases the camera's starts and stops (long shots down the ice) and evens out its steps. "
+      "Quick: close to the game. Gentle: softer. Softest: slowest and smoothest, trails the game's camera "
+      "furthest during fast pans.",
+      RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, CAM_CHOICES, 4, NULL },
     { "bos.rate", "Smooth motion", "Pictures per second",
       "Extra pictures between the NES's 60 frames: the camera moves a fraction of a pixel in each. "
       "Pick your monitor's refresh rate or lower (180 suits a 240 Hz FreeSync monitor).",
@@ -877,7 +1014,7 @@ static int menu_get(void *ctx, const RecompRuntimeUiItem *it, int *out)
 static int menu_set(void *ctx, const RecompRuntimeUiItem *it, int v)
 {
     (void)ctx;
-    if (key_is(it, "bos.smooth")) { s_smooth = s_smooth_saved = v != 0; restart(); }
+    if (key_is(it, "bos.smooth")) { s_smooth = s_smooth_saved = clampi(v, 0, 3); restart(); s_prepared = -1; }
     else if (key_is(it, "bos.rate")) {
         s_present_rate = s_rate_saved = clampi(v, 0, 1000);
         s_extras.present_rate = (unsigned)s_present_rate;
@@ -927,6 +1064,7 @@ static CycHostExtras s_extras = {
     .option          = option,
     .state_loaded    = state_loaded,
     .present_phase   = present_phase,
+    .present_from_snapshot = true,
     .menu_items      = BOS_MENU_ITEMS,
     .menu_item_count = BOS_MENU_COUNT,
     .menu_callbacks  = BOS_MENU_CALLBACKS,

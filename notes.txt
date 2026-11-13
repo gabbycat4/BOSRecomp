@@ -30,3 +30,11 @@ Measurements (fill in from scroll.log / oam.log / Mesen)
   Low lag: a player's step changes 0.27 px on average from frame to frame.
 
 Bugs seen while playing (where / what):
+
+Camera on long shots (scroll.log, frames 4101-4160 and others): the game's
+camera snaps from +2 to -7 px/frame at once, skips frames (-7 0 -7 0) and
+stops dead. SmoothCamera now eases it: accel 1.6 (Quick) / 1.0 (Gentle)
+px/frame per frame, brakes onto the real camera without passing it, and
+draws the trailing columns from the nametables. Offline on scroll.log:
+trails the game's camera by at most ~32 px; a few small bumps where the
+game's camera turns back toward it.
