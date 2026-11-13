@@ -36,6 +36,11 @@ if(NOT EXISTS "${BOS_ROM}")
 endif()
 option(NESRECOMP_HEADLESS "Build without SDL window/audio support" OFF)
 
+# Rewind starts off: its snapshot every few frames slows the frame after it,
+# which breaks the even 120/180 pictures a second (players can turn it on in
+# config.ini [Rewind] Enabled = 1).
+add_compile_definitions(NESRECOMP_REWIND_DEFAULT=0)
+
 include("${NESRECOMP_ROOT}/runner/cyc/project.cmake")
 
 set(bos_options "")

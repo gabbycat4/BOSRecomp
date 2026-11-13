@@ -38,3 +38,15 @@ px/frame per frame, brakes onto the real camera without passing it, and
 draws the trailing columns from the nametables. Offline on scroll.log:
 trails the game's camera by at most ~32 px; a few small bumps where the
 game's camera turns back toward it.
+
+Pacing (2026-11-13): NES emulation takes ~7.5-8.5 ms a frame on the Ryzen
+2700, so the engine now runs it on a second thread (present_from_snapshot)
+and holds each frame's picture to an even slot. 180 is flat (4.4-7.5 ms);
+240 does not fit (and is 240.4, above the monitor). Rewind's snapshot every
+4 frames slowed the next frame to ~21 ms after a goal: rewind now starts
+off (NESRECOMP_REWIND_DEFAULT=0 in CMakeLists.txt).
+
+Defaults (what a fresh config.ini gets): Steady glow + Gold highlight,
+Softest camera, no sprite flicker, lower-on-screen-in-front overlaps,
+Player glide Smooth, 60 pictures a second (players with fast monitors
+pick 120/180), edge crop 8, rewind off.

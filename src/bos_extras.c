@@ -24,13 +24,13 @@
  *
  *   Flash soften  [Game] FlashSoften: the game flashes the player with the
  *                 puck by switching him to a bright palette 2 frames in 6.
- *                 0 as the game, 1 a soft tint, 2 no flash, 3 (default) a
- *                 slow pulse (fades in and out 1.25 times a second), 4 a
+ *                 0 as the game, 1 a soft tint, 2 no flash, 3 a
+ *                 slow pulse (fades in and out 1.25 times a second), 4 (default) a
  *                 steady glow (no flashing at all). [Game] FlashColour: the
  *                 highlight's colour, 0 the game's white, 1 (default) gold,
  *                 2 sky blue, 3 green, 4 pink, 5 lavender.
  *
- *   Smooth camera [Game] SmoothCamera: 0 off, 1 quick, 2 (default) gentle, 3 softest.
+ *   Smooth camera [Game] SmoothCamera: 0 off, 1 quick, 2 gentle, 3 (default) softest.
  *                 An eased camera (see "the eased camera" below); vertical
  *                 steps use a small smoother (SmoothMargin px, cropped).
  *
@@ -69,7 +69,7 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v;
 typedef struct { int top, bottom, left, right; } Crop;
 #define BOS_DEFAULT_CROP { 8, 8, 8, 8 }
 static Crop s_crop_saved = BOS_DEFAULT_CROP, s_crop = BOS_DEFAULT_CROP;
-static int  s_smooth_saved = 2, s_smooth = 2;   /* 0 off, 1 quick, 2 gentle */
+static int  s_smooth_saved = 3, s_smooth = 3;   /* 0 off, 1 quick, 2 gentle, 3 softest */
 static int  s_unlimit_saved = 1, s_unlimit = 1;
 static int  s_order_saved = 1, s_order = 1;
 static int  s_rate_saved, s_present_rate;
@@ -164,7 +164,7 @@ static int      s_fl_prev_n, s_flashing;
 static int8_t   s_base[64];      /* flashing now: the player's own palette, else -1 */
 static int8_t   s_own[64];       /* the sprite's own palette (base, or its palette) */
 static uint8_t  s_age[64];       /* frames since the sprite last flashed, 255: not flashing */
-static int      s_soft_saved = SOFT_PULSE, s_soft = SOFT_PULSE;
+static int      s_soft_saved = SOFT_STEADY, s_soft = SOFT_STEADY;
 
 static bool touching(const uint8_t *a, const uint8_t *b, int h)
 {
