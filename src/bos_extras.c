@@ -1,8 +1,8 @@
 /*
  * bos_extras.c - Blades of Steel's additions to the NESRecomp cycle host
- * (cyc_host_extras.h). Presentation and observation only: nothing here
- * changes what the emulated machine does. Adapted from DD2Recomp's
- * dd2_extras.c.
+ * (cyc_host_extras.h). Presentation and observation only, except Period
+ * length (below), the one option that changes the game itself. Adapted from
+ * DD2Recomp's dd2_extras.c.
  *
  *   Logs          --scroll-log FILE: one line per frame (scroll X/Y the PPU
  *                 drew the playfield with, its steps, the playfield rows,
@@ -30,7 +30,7 @@
  *                 highlight's colour, 0 the game's white, 1 (default) gold,
  *                 2 sky blue, 3 green, 4 pink, 5 lavender.
  *
- *   Smooth camera [Game] SmoothCamera: 0 off, 1 quick, 2 gentle, 3 (default) softest.
+ *   Smooth camera [Game] SmoothCamera: 0 off, 1 calm, 2 calmer, 3 (default) slowest.
  *                 An eased camera (see "the eased camera" below); vertical
  *                 steps use a small smoother (SmoothMargin px, cropped).
  *
@@ -42,10 +42,22 @@
  *                 pictures between the NES's frames in which the camera
  *                 moves on a fraction of a pixel. The picture is always
  *                 drawn at PresentScale (4) times the NES size.
+ *
+ *   Period length [Game] PeriodMinutes (5, 10, 15 or 20 = the game's; also
+ *                 --period N): the clock is BCD digits in RAM $C0 $C1 : $C2
+ *                 $C3 (minutes tens, ones : seconds tens, ones), one game
+ *                 second every 8 frames ($C6AD, decrement of $63 from 7), so
+ *                 20:00 is 9600 frames = 2:40 of real time. Only $CEA7 sets
+ *                 it (LDA #$02 / STA $C0, zeros into $C1-$C3) at each
+ *                 period's start. When the clock has just become 20:00,
+ *                 frame_begin writes the chosen minutes before the next frame
+ *                 runs (cyc_mod_poke). The game ends the period at 00:00 as
+ *                 usual. Takes effect from the next period.
  */
 #include "cyc_host_extras.h"
 #include "cyc_core.h"
 #include "cyc_render.h"
+#include "cyc_mod.h"
 #include "bos_smooth.h"
 
 #include <stdio.h>
@@ -69,12 +81,14 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v;
 typedef struct { int top, bottom, left, right; } Crop;
 #define BOS_DEFAULT_CROP { 8, 8, 8, 8 }
 static Crop s_crop_saved = BOS_DEFAULT_CROP, s_crop = BOS_DEFAULT_CROP;
-static int  s_smooth_saved = 3, s_smooth = 3;   /* 0 off, 1 quick, 2 gentle, 3 softest */
+static int  s_smooth_saved = 3, s_smooth = 3;   /* 0 off, 1 calm, 2 calmer, 3 slowest */
 static int  s_unlimit_saved = 1, s_unlimit = 1;
 static int  s_order_saved = 1, s_order = 1;
 static int  s_rate_saved, s_present_rate;
 static int  s_scale_saved = 4, s_scale = 4;
 static int  s_margin_saved = BOS_SMOOTH_MARGIN, s_margin = BOS_SMOOTH_MARGIN;
+static int  s_period_saved = 20, s_period = 20;   /* period length, game minutes: 5/10/15/20 */
+static int period_ok(int v) { return v == 5 || v == 10 || v == 15 || v == 20; }
 
 /* ---- per-frame state ---- */
 static CycHostExtras s_extras;              /* defined at the end */
@@ -510,51 +524,85 @@ static void prepare(const uint32_t *native)
 static int floordiv(int a, int k) { return a >= 0 ? a / k : -((-a + k - 1) / k); }
 
 /* ---- the eased camera (SmoothCamera) ----
- * Measured (scroll.log): when the puck is shot down the ice the game's
- * camera goes from 2 px a frame to 7 at once, skips some frames on the way
- * (-7 0 -7 -7 0) and stops dead. The picture's camera follows it with a
- * limited acceleration (SmoothCamera 1 quick, 2 gentle, 3 softest): it speeds up
- * gradually, rides through the skipped frames, and brakes along a curve that
- * ends exactly on the game's camera, never past it. While it trails, the
- * columns the game has already scrolled away are drawn from the nametables
- * (VRAM still holds them; the game only rewrites the column 256 px ahead),
- * so nothing extra is cropped. */
-enum { CAM_CUT = 16, CAM_LAG_MAX = 96 };
-static const double CAM_ACCEL[] = { 0, 1.6, 1.0, 0.8 };   /* px/frame per frame, by SmoothCamera */
-typedef struct { bool have; double cam, x, v, px; } CamFollow;
+ * Measured (scroll.log): the game's camera mostly stands still, then moves
+ * in 1-7 px steps; on a shot down the ice it goes from +2 to -7 px a frame
+ * at once, skips frames on the way (-7 0 -7 -7 0) and stops dead.
+ *
+ * The picture's camera follows the moving average of the game's camera over
+ * the last N frames (which absorbs its steps and stutters) with a critically
+ * damped spring of time constant T frames (no overshoot), integrated in
+ * CAM_SUB steps a frame. The in-between pictures sample those steps, so its
+ * speed changes smoothly within a frame, not in a jump at every NES frame.
+ * tools/camsim/camsim.py measured the designs on scroll.log (5 minutes of
+ * play) at 240 pictures a second:
+ *                       lurch*   jolts/s   trails (99% / worst)
+ *   old Softest (a=0.8)  3.41     4.07      -    / 66 px
+ *   Calm    N=8  T=3     0.78     0.03     43   / 62 px
+ *   Calmer  N=12 T=3     0.63     0        52   / 75 px
+ *   Slowest N=12 T=4     0.53     0        60   / 87 px
+ *   * 99.9th percentile speed change, px/frame per frame; a jolt is a
+ *     picture-to-picture speed jump over 0.25 px/frame.
+ * While it trails, the columns the game has already scrolled away are drawn
+ * from the nametables (VRAM still holds them; the game only rewrites the
+ * column 256 px ahead), so nothing extra is cropped. */
+enum { CAM_CUT = 16, CAM_LAG_MAX = 96, CAM_SUB = 8, CAM_HIST = 16 };
+static const int    CAM_N[] = { 0, 8, 12, 12 };      /* average over N frames, by SmoothCamera */
+static const double CAM_T[] = { 0, 3, 3, 4 };        /* spring time constant, frames */
+typedef struct {
+    bool   have;
+    double cam, x, v;                 /* the game's camera (unwrapped), the picture's, its speed */
+    double hist[CAM_HIST];            /* the game's camera, last CAM_HIST frames */
+    int    n, head;
+    double sub[CAM_SUB + 1];          /* the picture's camera through this frame (sub[0]: its start) */
+} CamFollow;
 static CamFollow s_cam;
 
 static void cam_frame(bool on, int dx)
 {
     CamFollow *c = &s_cam;
     if (!on || !s_smooth || !c->have || dx > CAM_CUT || dx < -CAM_CUT) {
-        *c = (CamFollow){ on, 0, 0, 0, 0 };
+        memset(c, 0, sizeof(*c));     /* a cut, or no playfield: start again on the game's camera */
+        c->have = on;
         return;
     }
-    double a = CAM_ACCEL[clampi(s_smooth, 1, 3)];
-    c->px = c->x;
+    int level = clampi(s_smooth, 1, 3), N = CAM_N[level];
+    double w = 1.0 / CAM_T[level], h = 1.0 / CAM_SUB;
     c->cam += dx;
-    double e = c->cam - c->x, d = fabs(e);
-    /* The fastest speed that can still brake to a stop in distance d at
-     * this acceleration (steps v, v-a, v-2a, ...). */
-    double vd = sqrt(a * a / 4 + 2 * a * d) - a / 2;
-    if (e < 0) vd = -vd;
-    double dv = vd - c->v;
-    c->v += dv > a ? a : dv < -a ? -a : dv;
-    if ((e > 0 && c->v > e) || (e < 0 && c->v < e)) c->v = e;     /* land on it, never past */
-    c->x += c->v;
-    e = c->cam - c->x;
-    if (e > CAM_LAG_MAX) c->x = c->cam - CAM_LAG_MAX;
-    if (e < -CAM_LAG_MAX) c->x = c->cam + CAM_LAG_MAX;
+    c->hist[c->head] = c->cam;
+    c->head = (c->head + 1) % CAM_HIST;
+    if (c->n < CAM_HIST) c->n++;
+    int m = c->n < N ? c->n : N;
+    double sum = 0;
+    for (int k = 0; k < m; ++k) sum += c->hist[(c->head - 1 - k + CAM_HIST) % CAM_HIST];
+    double target = sum / m;
+    c->sub[0] = c->x;
+    for (int k = 1; k <= CAM_SUB; ++k) {
+        double acc = w * w * (target - c->x) - 2 * w * c->v;
+        c->v += acc * h;
+        c->x += c->v * h;
+        c->sub[k] = c->x;
+    }
+    double e = c->cam - c->x, fix = 0;           /* safety only: never reached on scroll.log (87 px) */
+    if (e > CAM_LAG_MAX) fix = e - CAM_LAG_MAX;
+    if (e < -CAM_LAG_MAX) fix = e + CAM_LAG_MAX;
+    if (fix) {
+        c->x += fix;
+        for (int k = 0; k <= CAM_SUB; ++k) c->sub[k] += fix;
+    }
 }
 
-/* The picture's shift (native px: draw native column x - shift at screen
- * column x) a fraction p of a frame after the machine frame. Between frames
- * the camera moves from the previous frame's position to this one's. */
+/* How far the picture's camera trails the game's at phase p of the frame. */
 static double cam_shift(double p)
 {
     if (!s_cam.have) return 0;
-    double xd = s_present_rate > 60 ? s_cam.px + (s_cam.x - s_cam.px) * p : s_cam.x;
+    double xd = s_cam.x;
+    if (s_present_rate > 60) {
+        double k = p * CAM_SUB;
+        int k0 = (int)k;
+        if (k0 > CAM_SUB - 1) k0 = CAM_SUB - 1;
+        if (k0 < 0) k0 = 0;
+        xd = s_cam.sub[k0] + (s_cam.sub[k0 + 1] - s_cam.sub[k0]) * (k - k0);
+    }
     return s_cam.cam - xd;
 }
 
@@ -767,6 +815,7 @@ static void load_setting(void *ctx, const char *key, const char *value)
     else if (!strcmp(key, "FlashColour"))    s_tint = s_tint_saved = clampi(v, 0, TINT_COUNT - 1);
     else if (!strcmp(key, "CharGlide"))      s_glide = s_glide_saved = clampi(v, 0, GLIDE_MODES - 1);
     else if (!strcmp(key, "PresentScale"))   s_scale = s_scale_saved = clampi(v, 1, SCALE_MAX);
+    else if (!strcmp(key, "PeriodMinutes") && period_ok(v)) s_period = s_period_saved = v;
     s_crop = s_crop_saved;
 }
 
@@ -786,6 +835,27 @@ static void save_settings(void *ctx, FILE *f)
     fprintf(f, "CharGlide = %d\n", s_glide_saved);
     fprintf(f, "PresentRate = %d\n", s_rate_saved);
     fprintf(f, "PresentScale = %d\n", s_scale_saved);
+    fprintf(f, "PeriodMinutes = %d\n", s_period_saved);
+}
+
+/* ---- period length (see the top of the file) ---- */
+static void frame_begin(void *ctx)
+{
+    (void)ctx;
+    static uint8_t prev[4];
+    static bool have;
+    const uint8_t *ram = cyc_cpu_ram();
+    if (!ram) return;
+    uint8_t now[4] = { ram[0xC0], ram[0xC1], ram[0xC2], ram[0xC3] };
+    bool fresh = now[0] == 2 && !now[1] && !now[2] && !now[3];
+    if (fresh && have && memcmp(prev, now, sizeof(now)) && s_period != 20) {
+        cyc_mod_poke(0x00C0, (uint8_t)(s_period / 10));
+        cyc_mod_poke(0x00C1, (uint8_t)(s_period % 10));
+        now[0] = (uint8_t)(s_period / 10);
+        now[1] = (uint8_t)(s_period % 10);
+    }
+    memcpy(prev, now, sizeof(prev));
+    have = true;
 }
 
 /* ---- per frame ---- */
@@ -796,7 +866,7 @@ static void restart(void)
     s_prev_x = s_prev_y = -1;
     bos_smooth_set_margin(&s_smy, s_margin, false);
     bos_smooth_reset(&s_smy);
-    s_cam = (CamFollow){ false, 0, 0, 0, 0 };
+    memset(&s_cam, 0, sizeof(s_cam));
 }
 
 static void power_on(void *ctx)
@@ -881,7 +951,7 @@ static const CycHostOption s_options[] = {
     { "--oam-log",         true, "FILE: the frame's 64 sprite entries (Y tile attr X, hex) every frame" },
     { "--scroll-line",     true, "N: playfield line the scroll is sampled on (default 120)" },
     { "--overscan",        true, "T,B,L,R: crop this many pixels for this run" },
-    { "--smooth",          true, "0-3: eased camera off / quick / gentle / softest for this run" },
+    { "--smooth",          true, "0-3: eased camera off / calm / calmer / slowest for this run" },
     { "--smooth-margin",   true, "N: smoothing margin in px, 1-12 (default 3)" },
     { "--no-sprite-limit", true, "0|1: draw every sprite (no flicker) for this run" },
     { "--sprite-order",    true, "0|1: overlaps in the game's order / lower on screen in front" },
@@ -890,6 +960,7 @@ static const CycHostOption s_options[] = {
     { "--char-glide",      true, "0|1|2: players glide off / smooth (1/60 s behind) / low lag (predicts)" },
     { "--present-rate",    true, "N: pictures per second, e.g. 120 or 240 (0: one per frame)" },
     { "--present-scale",   true, "K: picture scale 1-6 (default 4)" },
+    { "--period",          true, "5|10|15|20: period length in game minutes for this run (20: the game's)" },
 };
 
 static bool parse_int(const char *value, int lo, int hi, int *out)
@@ -903,6 +974,12 @@ static bool parse_int(const char *value, int lo, int hi, int *out)
 
 static bool option(void *ctx, const char *name, const char *value)
 {
+    if (!strcmp(name, "--period")) {
+        int v;
+        if (!parse_int(value, 5, 20, &v) || !period_ok(v)) return false;
+        s_period = v;
+        return true;
+    }
     (void)ctx;
     if (!strcmp(name, "--scroll-log") || !strcmp(name, "--oam-log")) {
         bool scroll = name[2] == 's';
@@ -939,7 +1016,7 @@ static bool option(void *ctx, const char *name, const char *value)
 
 static const char *const RATE_CHOICES[] = { "60 (off)", "120", "180", "240" };
 static const int RATE_VALUES[] = { 0, 120, 180, 240 };
-static const char *const CAM_CHOICES[] = { "Off", "Quick", "Gentle", "Softest" };
+static const char *const CAM_CHOICES[] = { "Off", "Calm", "Calmer", "Slowest" };
 static const char *const GLIDE_CHOICES[] = { "Off", "Smooth", "Low lag" };
 static const char *const ORDER_CHOICES[] = { "Game's order", "Lower on screen in front" };
 static const char *const SOFT_CHOICES[] = { "Off (as the game)", "Soft", "Slow pulse", "Steady glow", "None" };
@@ -947,12 +1024,14 @@ static const int SOFT_VALUES[] = { SOFT_OFF, SOFT_SOFT, SOFT_PULSE, SOFT_STEADY,
 static const char *const TINT_CHOICES[] = { "Game's white", "Gold", "Sky blue", "Green", "Pink", "Lavender" };
 static const char *const CROP_CHOICES[] = { "Off", "Standard", "More", "Custom (config.ini)" };
 static const Crop CROP_PRESETS[] = { { 0, 0, 0, 0 }, { 8, 8, 8, 8 }, { 12, 12, 12, 12 } };
+static const char *const PERIOD_CHOICES[] = { "5:00 (40 s)", "10:00 (1:20)", "15:00 (2:00)", "20:00 (2:40, the game's)" };
+static const int PERIOD_VALUES[] = { 5, 10, 15, 20 };
 
 static const RecompRuntimeUiItem s_menu[] = {
     { "bos.smooth", "Smooth motion", "Smooth camera",
-      "Eases the camera's starts and stops (long shots down the ice) and evens out its steps. "
-      "Quick: close to the game. Gentle: softer. Softest: slowest and smoothest, trails the game's camera "
-      "furthest during fast pans.",
+      "Smooths out the game's jumpy camera (its 2-7 pixel steps and sudden turns on long shots): the view "
+      "glides and turns gently instead. Calm: closest to the game. Calmer: softer. Slowest: the gentlest, "
+      "trails the game's camera furthest on long shots (the puck always stays on screen).",
       RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, CAM_CHOICES, 4, NULL },
     { "bos.rate", "Smooth motion", "Pictures per second",
       "Extra pictures between the NES's 60 frames: the camera moves a fraction of a pixel in each. "
@@ -976,6 +1055,10 @@ static const RecompRuntimeUiItem s_menu[] = {
     { "bos.order", "Picture", "Overlapping sprites",
       "Which sprite is in front where two overlap (with No sprite flicker on).",
       RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, ORDER_CHOICES, 2, NULL },
+    { "bos.period", "Game", "Period length",
+      "How long each period lasts on the game's clock (real time in brackets: the clock runs fast). "
+      "Starts with the next period. This one changes the game itself, not just the picture.",
+      RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, PERIOD_CHOICES, 4, PERIOD_VALUES },
     { "bos.crop", "Picture", "Edge crop",
       "Hides the screen edges where the NES draws scrolling garbage. Standard: 8 pixels.",
       RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, CROP_CHOICES, 4, NULL },
@@ -1007,6 +1090,7 @@ static int menu_get(void *ctx, const RecompRuntimeUiItem *it, int *out)
     else if (key_is(it, "bos.glide")) *out = s_glide;
     else if (key_is(it, "bos.tint")) *out = s_tint;
     else if (key_is(it, "bos.crop")) *out = crop_preset();
+    else if (key_is(it, "bos.period")) *out = s_period;
     else return 0;
     return 1;
 }
@@ -1024,6 +1108,10 @@ static int menu_set(void *ctx, const RecompRuntimeUiItem *it, int v)
     else if (key_is(it, "bos.glide")) s_glide = s_glide_saved = clampi(v, 0, GLIDE_MODES - 1);
     else if (key_is(it, "bos.tint")) { s_tint = s_tint_saved = clampi(v, 0, TINT_COUNT - 1); s_prepared = -1; }
     else if (key_is(it, "bos.soften")) { s_soft = s_soft_saved = clampi(v, 0, SOFT_MODES - 1); s_prepared = -1; }
+    else if (key_is(it, "bos.period")) {
+        if (!period_ok(v)) return 0;
+        s_period = s_period_saved = v;
+    }
     else if (key_is(it, "bos.crop")) {
         if (v < 0 || v > 2) return 0;              /* Custom: edit config.ini */
         s_crop = s_crop_saved = CROP_PRESETS[v];
@@ -1058,6 +1146,7 @@ static CycHostExtras s_extras = {
     .load_setting    = load_setting,
     .save_settings   = save_settings,
     .power_on        = power_on,
+    .frame_begin     = frame_begin,
     .frame_end       = frame_end,
     .options         = s_options,
     .option_count    = sizeof(s_options) / sizeof(s_options[0]),
